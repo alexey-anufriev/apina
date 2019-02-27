@@ -22,7 +22,7 @@ internal class JacksonTypeTranslator(private val settings: TranslationSettings,
      * Maps translated simple names back to their original types.
      * Needed to make sure that our mapping remains unique.
      */
-    private val translatedNames = HashMap<String, JavaType.Basic>()
+    private val translatedNames = HashMap<String, JavaType>()
 
     fun translateType(javaType: JavaType, element: JavaAnnotatedElement, env: TypeEnvironment): ApiType {
         val type = translateType(javaType, env)
@@ -43,7 +43,7 @@ internal class JacksonTypeTranslator(private val settings: TranslationSettings,
             env.lookup(type)?.let {
                 check(it != type) { "Looking up type returned itself: $type in $env" }
                 translateType(it, env)
-            } ?: ApiType.Primitive.ANY
+            } ?: ApiType.Variable(type.name)
         is JavaType.Wildcard ->
             type.lowerBound?.let { translateType(it, env) } ?: ApiType.Primitive.ANY
         is JavaType.InnerClass ->
@@ -97,33 +97,36 @@ internal class JacksonTypeTranslator(private val settings: TranslationSettings,
             classes.isInstanceOf<Optional<*>>(baseType) && arguments.size == 1 ->
                 ApiType.Nullable(arguments[0])
             else ->
-                translateType(baseType, env)
+                translateClassType(type, env)
         }
     }
 
-    private fun translateClassType(type: JavaType.Basic, env: TypeEnvironment): ApiType {
+    private fun translateClassType(type: JavaType, env: TypeEnvironment): ApiType {
         val typeName = classNameForType(type)
 
         if (settings.isImported(typeName))
             return ApiType.BlackBox(typeName)
 
-        if (settings.isBlackBoxClass(type.name)) {
-            log.debug("Translating {} as black box", type.name)
+        if (settings.isBlackBoxClass(type.nonGenericClassName)) {
+            log.debug("Translating {} as black box", type.nonGenericClassName)
 
             api.addBlackBox(typeName)
             return ApiType.BlackBox(typeName)
         }
 
-        val jsonValueMethod = classes.findClass(type.name)?.findMethodWithAnnotation(JSON_VALUE)
+        val jsonValueMethod = classes.findClass(type.nonGenericClassName)?.findMethodWithAnnotation(JSON_VALUE)
         if (jsonValueMethod != null) {
             api.addTypeAlias(typeName, translateType(jsonValueMethod.returnType, env))
             return ApiType.BlackBox(typeName)
         }
 
-        val classType = ApiType.Class(typeName)
+        val classType = ApiType.Class(typeName, when (type) {
+            is JavaType.Parameterized -> type.arguments.map { translateType(it, env) }
+            else -> listOf()
+        })
 
         if (!api.containsType(typeName)) {
-            val aClass = classes.findClass(type.name)
+            val aClass = classes.findClass(type.nonGenericClassName)
             if (aClass != null) {
                 when {
                     aClass.isEnum ->
@@ -133,17 +136,23 @@ internal class JacksonTypeTranslator(private val settings: TranslationSettings,
                         createDiscriminatedUnion(aClass, typeInfo)
                     }
                     else -> {
-                        val classDefinition = ClassDefinition(typeName)
-
+                        val classDefinition = ClassDefinition(typeName, when (aClass.type) {
+                            is JavaType.Parameterized -> aClass.type.arguments.map { ApiType.Variable(it.toString()) }
+                            else -> emptyList()
+                        })
                         // We must first add the definition to api and only then proceed to
                         // initialize it because initialization of properties could refer
                         // back to this same class and we'd get infinite recursion if the
                         // class is not already installed.
+                        classDefinition.addType(classType)
                         api.addClassDefinition(classDefinition)
                         initClassDefinition(classDefinition, BoundClass(aClass, env))
                     }
                 }
             }
+        } else if (classType.arguments.isNotEmpty()) {
+            val existingParameterizedClass = api.classDefinitions.single { it.type == typeName }
+            existingParameterizedClass.addType(classType)
         }
 
         return classType
@@ -164,7 +173,7 @@ internal class JacksonTypeTranslator(private val settings: TranslationSettings,
         api.addDiscriminatedUnion(union)
 
         for ((name, cl) in findSubtypes(javaClass)) {
-            val def = ClassDefinition(classNameForType(cl.type.toBasicType()))
+            val def = ClassDefinition(classNameForType(cl.type.toBasicType()), emptyList())
             initClassDefinition(def, BoundClass(cl, TypeEnvironment.empty()))
             union.addType(name, def)
         }
@@ -196,12 +205,12 @@ internal class JacksonTypeTranslator(private val settings: TranslationSettings,
         }
     }
 
-    private fun classNameForType(type: JavaType.Basic): ApiTypeName {
-        val translatedName = translateClassName(type.name)
-
-        val existingType = translatedNames.putIfAbsent(translatedName, type)
-        if (existingType != null && type != existingType)
-            throw DuplicateClassNameException(type.name, existingType.name)
+    private fun classNameForType(type: JavaType): ApiTypeName {
+        val translatedName = translateClassName(type.nonGenericClassName)
+        // FIXME
+//        val existingType = translatedNames.putIfAbsent(translatedName, type)
+//        if (existingType != null && type != existingType)
+//            throw DuplicateClassNameException(type.nonGenericClassName, existingType.nonGenericClassName)
 
         return ApiTypeName(translatedName)
     }

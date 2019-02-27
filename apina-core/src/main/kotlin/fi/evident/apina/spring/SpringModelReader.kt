@@ -69,6 +69,7 @@ class SpringModelReader private constructor(private val classes: JavaModel, priv
     private fun resolveResponseBody(method: JavaMethod, env: TypeEnvironment): ApiType? {
         val returnType = method.returnType
 
+//        println("R: " + returnType)
         return if (!returnType.isVoid) {
             typeTranslator.translateType(unwrapReturnType(returnType), method, env)
         } else {
